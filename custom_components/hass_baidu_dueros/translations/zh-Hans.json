@@ -1,0 +1,47 @@
+{
+    "config": {
+        "title": "HASS 百度小度音箱",
+        "step": {
+            "user": {
+                "title": "HASS 百度小度音箱配置",
+                "description": "配置小度音箱 HTTP 自建技能连接。请先在小度开放平台创建智能家居技能，获取 Client ID、Client Secret 和技能 ID。",
+                "data": {
+                    "client_id": "Client ID（以dueros开头）",
+                    "client_secret": "Client Secret",
+                    "ha_url": "HA 外部访问地址（留空自动检测）",
+                    "bot_id": "技能ID / Bot ID（从小度开放平台获取）",
+                    "entity_key": "设备ID加密密钥（选填，16个字符）"
+                }
+            },
+            "reconfigure": {
+                "title": "HASS 百度小度音箱重新配置",
+                "data": {
+                    "client_id": "Client ID（以dueros开头）",
+                    "client_secret": "Client Secret",
+                    "ha_url": "HA 外部访问地址",
+                    "bot_id": "技能ID / Bot ID",
+                    "entity_key": "设备ID加密密钥（选填，16个字符）"
+                }
+            }
+        },
+        "error": {
+            "entity_key_validation": "加密密钥需要16个字符长度",
+            "client_id_validation": "Client ID 需要以 dueros 开头（需与小度技能平台配置一致）"
+        },
+        "abort": {
+            "already_configured": "该 Client ID 已配置",
+            "reconfigure_successful": "重新配置成功",
+            "single_instance_allowed": "只允许配置一个实例"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "HASS 百度小度音箱选项",
+                "data": {
+                    "entity_key": "设备ID加密密钥（选填，16个字符）"
+                }
+            }
+        }
+    }
+}

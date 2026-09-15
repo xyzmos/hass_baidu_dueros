@@ -1,0 +1,6 @@
+reload:
+  name: 重新加载设备
+  description: 重新加载设备配置并通知小度平台重新发现设备。
+debug_discovery:
+  name: 调试设备发现
+  description: 调试用，触发设备发现并输出结果到日志。

@@ -1,0 +1,47 @@
+{
+    "config": {
+        "title": "HASS Baidu DuerOS",
+        "step": {
+            "user": {
+                "title": "HASS Baidu DuerOS Setup",
+                "description": "Configure Xiaodu (DuerOS) HTTP self-built skill connection. Please create a smart home skill on the Xiaodu developer platform first to get Client ID, Client Secret, and Bot ID.",
+                "data": {
+                    "client_id": "Client ID (starts with dueros)",
+                    "client_secret": "Client Secret",
+                    "ha_url": "HA external URL (auto-detected if empty)",
+                    "bot_id": "Skill ID / Bot ID (from Xiaodu developer platform)",
+                    "entity_key": "Device ID encryption key (optional, 16 characters)"
+                }
+            },
+            "reconfigure": {
+                "title": "HASS Baidu DuerOS Reconfigure",
+                "data": {
+                    "client_id": "Client ID (starts with dueros)",
+                    "client_secret": "Client Secret",
+                    "ha_url": "HA external URL",
+                    "bot_id": "Skill ID / Bot ID",
+                    "entity_key": "Device ID encryption key (optional, 16 characters)"
+                }
+            }
+        },
+        "error": {
+            "entity_key_validation": "Encryption key must be 16 characters",
+            "client_id_validation": "Client ID must start with dueros (keep it consistent with the Xiaodu developer platform)"
+        },
+        "abort": {
+            "already_configured": "This Client ID is already configured",
+            "reconfigure_successful": "Reconfiguration successful",
+            "single_instance_allowed": "Only a single instance is allowed"
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "HASS Baidu DuerOS Options",
+                "data": {
+                    "entity_key": "Device ID encryption key (optional, 16 characters)"
+                }
+            }
+        }
+    }
+}

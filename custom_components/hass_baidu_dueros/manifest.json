@@ -1,0 +1,15 @@
+{
+  "domain": "hass_baidu_dueros",
+  "name": "小度音箱",
+  "documentation": "https://github.com/xyzmos/hass_baidu_dueros",
+  "config_flow": true,
+  "requirements": ["pycryptodome>=3.9.8", "PyJWT>=2.0.0"],
+  "dependencies": ["http"],
+  "codeowners": ["xyzmos"],
+  "integration_type": "hub",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/xyzmos/hass_baidu_dueros/issues",
+  "loggers": ["hass_baidu_dueros"],
+  "homeassistant": "2025.7.0",
+  "version": "2025.9.1"
+}
