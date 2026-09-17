@@ -5,10 +5,8 @@ HAVCS_SUPPORTED_DOMAINS = [
     'media_player', 'scene', 'switch', 'vacuum', 'sensor',
 ]
 
-DEFAULT_EXPOSED_DOMAINS = [
-    'climate', 'cover', 'fan', 'humidifier', 'light',
-    'media_player', 'scene', 'switch', 'vacuum',
-]
+# 暴露范围以 HA「语音助手」中的 Assist（conversation）设置为准
+ASSISTANT_CONVERSATION = 'conversation'
 
 ATTR_DEVICE_ID = 'device_id'
 ATTR_DEVICE_ENTITY_ID = 'entity_id'

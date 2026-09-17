@@ -110,7 +110,13 @@ async def async_setup_entry(hass, config_entry):
 
         debounce = {'cancel': None}
 
-        async def _apply_registry_change():
+        @callback
+        def _cancel_debounce() -> None:
+            if debounce['cancel'] is not None:
+                debounce['cancel']()
+                debounce['cancel'] = None
+
+        async def _apply_registry_change(now=None):
             debounce['cancel'] = None
             handler.vcdm.all(hass, init_flag=True)
             _resubscribe_state_listener()
@@ -122,15 +128,14 @@ async def async_setup_entry(hass, config_entry):
                 return
             if debounce['cancel'] is not None:
                 debounce['cancel']()
-            debounce['cancel'] = async_call_later(
-                hass, _REGISTRY_DEBOUNCE_SECONDS, lambda now: hass.async_create_task(_apply_registry_change())
-            )
+            # 必须传协程函数：普通 lambda 会被 HA 判定为 Executor 任务而丢到线程池执行
+            debounce['cancel'] = async_call_later(hass, _REGISTRY_DEBOUNCE_SECONDS, _apply_registry_change)
 
         remove_entity_reg_listener = hass.bus.async_listen(
             EVENT_ENTITY_REGISTRY_UPDATED, _on_entity_registry_changed
         )
         config_entry.async_on_unload(remove_entity_reg_listener)
-        config_entry.async_on_unload(lambda: debounce['cancel'] and debounce['cancel']())
+        config_entry.async_on_unload(_cancel_debounce)
 
         async def async_handler_service(service):
             if service.service == SERVICE_RELOAD:

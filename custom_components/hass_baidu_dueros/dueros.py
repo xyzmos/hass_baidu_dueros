@@ -48,6 +48,8 @@ _TIMING_SERVICE_MAP = {
 
 # 发现设备数量上限（协议限制 300）
 _MAX_APPLIANCES = 300
+# 发现分组数量上限（协议限制 10）
+_MAX_GROUPS = 10
 
 # DuerOS AIR_CONDITION mode → HA hvac_mode
 _DUEROS_TO_HA_CLIMATE_MODE = {
@@ -68,8 +70,50 @@ _LOCATION_ENUM = {
     '餐厅': 'RESTAURANT',
 }
 
+# DuerOS 扫地机 mode → HA vacuum state
+_SWEEPING_MODE_HA_STATE = {
+    'AUTO': 'cleaning',
+    'AUTO_CLEAN': 'cleaning',
+    'FOCUS': 'cleaning',
+    'FOCUS_CLEAN': 'cleaning',
+    'ALONG_EDGE': 'cleaning',
+    'EDGE': 'cleaning',
+    'AUTO_MOP': 'cleaning',
+    'FOCUS_MOP': 'cleaning',
+    'ALONG_EDGE_MOP': 'cleaning',
+    'STANDARD': 'cleaning',
+    'POWERFUL': 'cleaning',
+    'MAX': 'cleaning',
+    'QUIET': 'cleaning',
+    'ANTI_DISTURB': 'cleaning',
+    'CHARGE': 'returning',
+    'PAUSE': 'paused',
+}
+
+# DuerOS 水量档位 → HA 百分比
+_WATER_LEVEL_PERCENT = {'LOW': 33, 'MIDDLE': 66, 'HIGH': 100}
+_WATER_LEVEL_KEYS = ('water', 'mop', '水量', '水箱')
+
+# 风扇模式中表示摆风的取值
+_SWING_MODES = ('SWING', 'OSCILLATE', 'SWING_UP_DOWN', 'SWING_LEFT_RIGHT',
+                'SWING_LEFT_RIGHT_SWING', '摆风', '摆动')
+# 风扇模式中表示停止摆风的取值
+_NON_SWING_FAN_MODES = ('STOP', 'CANCEL', 'OFF', 'NONE', 'FIXED', 'STATIC')
+
 
 _REPORT_WARN_INTERVAL = 3600.0
+
+# 色温上下界缺省值（设备未上报能力时使用）
+_DEFAULT_MIN_KELVIN = 2000.0
+_DEFAULT_MAX_KELVIN = 6500.0
+
+# 同一属性两次主动上报的最小间隔（小度限制 60 秒，21207）
+_CHANGE_REPORT_INTERVAL = 60.0
+# 设备同步限频（applianceId 失效时触发）
+_SYNC_MIN_INTERVAL = 600.0
+# 小度返回码：同属性 60 秒内重复同步 / 未收到 ReportStateResponse
+_SYNC_STATUS_RATE_LIMITED = 21207
+_SYNC_STATUS_NAME_MISMATCH = 21096
 
 
 def _shorten(text, limit=200):
@@ -126,25 +170,44 @@ def _payload_value(payload, key, default=None):
     return section
 
 
-def _kelvin_bounds(state):
+def _kelvin_bounds(state, hass=None, entity_id=None):
+    """色温上下界：优先取状态能力属性，其次读实体对象，最后用通用默认值。"""
     min_k = _as_float(state.attributes.get('min_color_temp_kelvin')) if state else None
     max_k = _as_float(state.attributes.get('max_color_temp_kelvin')) if state else None
-    return (min_k if min_k else 2000.0, max_k if max_k else 6500.0)
+    if (min_k is None or max_k is None) and hass is not None and entity_id:
+        entity = _get_light_entity(hass, entity_id)
+        if entity is not None:
+            if min_k is None:
+                min_k = _as_float(getattr(entity, 'min_color_temp_kelvin', None))
+            if max_k is None:
+                max_k = _as_float(getattr(entity, 'max_color_temp_kelvin', None))
+    return (min_k if min_k is not None else _DEFAULT_MIN_KELVIN,
+            max_k if max_k is not None else _DEFAULT_MAX_KELVIN)
 
 
-def _clamp_kelvin(state, value):
+def _get_light_entity(hass, entity_id):
+    try:
+        from homeassistant.helpers import entity_component
+
+        component = entity_component.get_component(hass, 'light')
+        return component.get_entity(entity_id) if component is not None else None
+    except Exception:
+        return None
+
+
+def _clamp_kelvin(hass, state, entity_id, value):
     if value is None:
         raise ValueError('colorTemperatureInKelvin is required')
-    min_k, max_k = _kelvin_bounds(state)
+    min_k, max_k = _kelvin_bounds(state, hass, entity_id)
     return int(_clamp(float(value), min_k, max_k))
 
 
-def _resolve_kelvin_delta(state, payload, sign):
+def _resolve_kelvin_delta(hass, state, entity_id, payload, sign):
     delta_pct = _as_float(_payload_value(payload, 'deltaPercentage', 10.0)) or 10.0
-    min_k, max_k = _kelvin_bounds(state)
+    min_k, max_k = _kelvin_bounds(state, hass, entity_id)
     current = _as_float(state.attributes.get('color_temp_kelvin')) if state else None
     current = current if current is not None else (min_k + max_k) / 2
-    return _clamp_kelvin(state, current + sign * delta_pct / 100 * (max_k - min_k))
+    return _clamp_kelvin(hass, state, entity_id, current + sign * delta_pct / 100 * (max_k - min_k))
 
 
 def _current_brightness_pct(state):
@@ -311,10 +374,13 @@ def _resolve_fan_percentage(payload):
 
 def _resolve_turn_on_state(entity_id, state):
     """按设备域判断 DuerOS turnOnState。"""
+    domain = entity_id.split('.', 1)[0]
+    if domain == 'scene':
+        # 场景是"执行"语义，没有可读状态，统一按 ON 上报
+        return 'ON'
     value = state.state
     if value in ('unavailable', 'unknown'):
         return 'OFF'
-    domain = entity_id.split('.', 1)[0]
     if domain == 'climate':
         return 'OFF' if value == 'off' else 'ON'
     if domain == 'cover':
@@ -323,8 +389,6 @@ def _resolve_turn_on_state(entity_id, state):
         return 'ON' if value in ('on', 'playing', 'paused', 'idle', 'buffering') else 'OFF'
     if domain == 'vacuum':
         return 'ON' if value in ('cleaning', 'returning') else 'OFF'
-    if domain == 'scene':
-        return 'ON'
     return 'ON' if value == 'on' else 'OFF'
 
 
@@ -352,11 +416,150 @@ def _resolve_suction(value):
 
 
 def _is_swing_mode(value):
-    """判断 DuerOS 模式值是否为风扇摆风。"""
+    """判断 DuerOS 模式值是否为风扇摆风；非摆风值返回 False（如 NORMAL/QUIET）。"""
     text = str(value).upper()
-    if text in ('SWING', 'OSCILLATE', 'SWING_UP_DOWN', 'SWING_LEFT_RIGHT', 'SWING_LEFT_RIGHT_SWING', '摆风', '摆动'):
+    if text in _SWING_MODES:
         return True
+    if text in _NON_SWING_FAN_MODES:
+        return False
     raise ValueError(f'unsupported fan mode: {value}')
+
+
+def _resolve_fan_mode(state, payload):
+    """风扇 SetModeRequest → (服务名, 数据)：优先匹配 preset_mode，否则按摆风处理。"""
+    mode = _resolve_mode_value(payload)
+    text = str(mode).upper()
+    state = state or None
+    presets = list((state.attributes.get('preset_modes') if state else None) or [])
+    for preset in presets:
+        if str(preset).upper() == text:
+            return (['fan'], ['set_preset_mode'], [{'preset_mode': preset}])
+    return (['fan'], ['oscillate'], [{'oscillating': _is_swing_mode(mode)}])
+
+
+def _resolve_work_state_from_mode(payload):
+    """扫地机 SetModeRequest → HA vacuum 状态。"""
+    mode = str(_payload_value(payload, 'mode', '')).upper()
+    if not mode:
+        raise ValueError('mode is required')
+    ha_state = _SWEEPING_MODE_HA_STATE.get(mode)
+    if not ha_state:
+        raise ValueError(f'unsupported sweeping mode: {mode}')
+    return ha_state
+
+
+def _resolve_water_level(payload, key='waterLevel'):
+    """扫地机水量档位 → HA 百分比；未指定档位时返回 None。"""
+    level = _payload_value(payload, key)
+    if level is None:
+        return None
+    text = str(level).upper()
+    if text not in _WATER_LEVEL_PERCENT:
+        raise ValueError(f'unsupported water level: {level}')
+    return _WATER_LEVEL_PERCENT[text]
+
+
+def _mode_to_swing(value):
+    """HA oscillating 布尔值 → DuerOS 风扇模式值。"""
+    if value is True:
+        return 'SWING'
+    if value is False:
+        return 'STOP'
+    return None
+
+
+def _first_number(state, keys):
+    for key in keys:
+        value = _as_float(state.attributes.get(key)) if state and state.attributes else None
+        if value is not None:
+            return value
+    return None
+
+
+def _clamp_percent_value(value):
+    if value is None:
+        return None
+    return int(_clamp_percent(value))
+
+
+def _resolve_electricity_capacity(state):
+    """电量：优先百分比实体（battery_level），其次数值实体，再退回 state。"""
+    if state is None:
+        return None
+    value = _first_number(state, ('battery_level', 'battery', 'electricity_capacity'))
+    if value is None:
+        value = _as_float(state.state)
+    return _clamp_percent_value(value)
+
+
+def _resolve_water_level_value(state):
+    """水量控制实体数值 → 水量档位（LOW/MIDDLE/HIGH）。"""
+    if state is None:
+        return None
+    value = _as_float(state.state)
+    if value is None:
+        return None
+    percent = _clamp_percent(value)
+    if percent <= 34:
+        return 'LOW'
+    if percent <= 67:
+        return 'MIDDLE'
+    return 'HIGH'
+
+
+def _vacuum_set_mode(payload):
+    """扫地机 SetModeRequest → HA 服务调用（HA 无清扫模式服务，按模式语义落到启停）。"""
+    ha_state = _resolve_work_state_from_mode(payload)
+    service = {'cleaning': 'start', 'returning': 'return_to_base', 'paused': 'pause'}.get(ha_state, 'start')
+    return (['vacuum'], [service], [{}])
+
+
+def _vacuum_water_level(payload):
+    """扫地机水量档位 → 水量控制实体的 set_value。"""
+    percent = _resolve_water_level(payload)
+    if percent is None:
+        raise ValueError('waterLevel is required')
+    return (['number'], ['set_value'], [{'value': percent}])
+
+
+def _vacuum_direction(payload):
+    """扫地机方向指令 → 清扫/暂停；其余方向 HA 无对应能力，如实报错。"""
+    direction = str(_payload_value(payload, 'direction', '')).upper()
+    if not direction:
+        raise ValueError('direction is required')
+    if direction in ('STOP', 'PAUSE'):
+        return (['vacuum'], ['pause'], [{}])
+    if direction in ('FORWARD', 'BACKWARD', 'LEFT', 'RIGHT', 'TURN_LEFT', 'TURN_RIGHT'):
+        raise ValueError('manual direction control is not supported by Home Assistant')
+    raise ValueError(f'unsupported direction: {direction}')
+
+
+def _kelvin_light_handlers() -> dict:
+    """灯色温指令处理器：light.turn_on 只接受 color_temp_kelvin 参数。
+
+    state 对象自带 hass 与 entity_id，可据此读取该灯真实的色温上下界。
+    """
+    def resolve_state(state):
+        return (getattr(state, 'hass', None), state.entity_id if state else None)
+
+    def set_handler(state, attributes, payload):
+        hass, entity_id = resolve_state(state)
+        value = _payload_value(payload, 'colorTemperatureInKelvin')
+        return (['light'], ['turn_on'],
+                [{'color_temp_kelvin': _clamp_kelvin(hass, state, entity_id, value)}])
+
+    def delta_handler(sign):
+        def handler(state, attributes, payload):
+            hass, entity_id = resolve_state(state)
+            value = _resolve_kelvin_delta(hass, state, entity_id, payload, sign)
+            return (['light'], ['turn_on'], [{'color_temp_kelvin': value}])
+        return handler
+
+    return {
+        'SetColorTemperatureRequest': set_handler,
+        'IncrementColorTemperatureRequest': delta_handler(1),
+        'DecrementColorTemperatureRequest': delta_handler(-1),
+    }
 
 
 class PlatformParameter:
@@ -387,6 +590,9 @@ class PlatformParameter:
         'warmthlevel': 'warmthLevel',
         'volume': 'volume',
         'suction': 'suction',
+        'electricitycapacity': 'electricityCapacity',
+        'waterlevel': 'waterLevel',
+        'location': 'location',
     }
 
     # Map HA state attribute keys (from __init__.py state listener) to DuerOS attribute names
@@ -412,7 +618,8 @@ class PlatformParameter:
         'is_volume_muted': 'muteState',
         'fan_speed': 'suction',
         'activity': 'state',
-        'preset_modes': 'warmthLevel',
+        'battery_level': 'electricityCapacity',
+        'cleaning_mode': 'mode',
     }
 
     # DuerOS attribute metadata: scale, legalValue
@@ -438,6 +645,8 @@ class PlatformParameter:
         'volume': {'scale': '', 'legalValue': '[0, 100]'},
         'muteState': {'scale': '', 'legalValue': 'BOOLEAN'},
         'suction': {'scale': '', 'legalValue': '(STANDARD, STRONG)'},
+        'electricityCapacity': {'scale': '%', 'legalValue': '[0, 100]'},
+        'waterLevel': {'scale': '', 'legalValue': '(LOW, MIDDLE, HIGH)'},
         'connectivity': {'scale': '', 'legalValue': '(UNREACHABLE, REACHABLE)'},
         'illumination': {'scale': 'lx', 'legalValue': 'DOUBLE'},
         'warmthLevel': {'scale': '', 'legalValue': '(LOW, MIDDLE, HIGH)'},
@@ -474,6 +683,8 @@ class PlatformParameter:
         'query_targettemperature': 'getTargetTemperature',
         'query_targethumidity': 'getTargetHumidity',
         'query_state': 'getState',
+        'query_electricitycapacity': 'getElectricityCapacity',
+        'query_waterlevel': 'getWaterLevel',
         'query_pm25': 'getAirPM25',
         'query_pm10': 'getAirPM10',
         'query_co2': 'getCO2Quantity',
@@ -486,6 +697,8 @@ class PlatformParameter:
         'decrement_colortemperature': 'decrementColorTemperature',
         'set_mode': 'setMode',
         'set_gear': 'setGear',
+        'set_suction': 'setSuction',
+        'set_waterlevel': 'setWaterLevel',
         'activate': 'turnOn',
     }
 
@@ -584,7 +797,7 @@ class PlatformParameter:
             'IncrementFanSpeedRequest': lambda state, attributes, payload: (['fan'], ['set_percentage'], [{'percentage': _clamp_percent((_as_float(state.attributes.get('percentage')) or 0) + 20)}]),
             'DecrementFanSpeedRequest': lambda state, attributes, payload: (['fan'], ['set_percentage'], [{'percentage': _clamp_percent((_as_float(state.attributes.get('percentage')) or 0) - 20)}]),
             'SetFanSpeedRequest': lambda state, attributes, payload: (['fan'], ['set_percentage'], [{'percentage': _resolve_fan_percentage(payload)}]),
-            'SetModeRequest': lambda state, attributes, payload: (['fan'], ['oscillate'], [{'oscillating': _is_swing_mode(_resolve_mode_value(payload))}]),
+            'SetModeRequest': lambda state, attributes, payload: _resolve_fan_mode(state, payload),
             'UnsetModeRequest': lambda state, attributes, payload: (['fan'], ['oscillate'], [{'oscillating': False}]),
         },
         'YUBA': {
@@ -634,6 +847,11 @@ class PlatformParameter:
             'PauseRequest': 'pause',
             'ContinueRequest': 'start',
             'SetSuctionRequest': lambda state, attributes, payload: (['vacuum'], ['set_fan_speed'], [{'fan_speed': _resolve_vacuum_fan_speed(state, payload)}]),
+            'SetModeRequest': lambda state, attributes, payload: _vacuum_set_mode(payload),
+            'ChargeRequest': lambda state, attributes, payload: (['vacuum'], ['return_to_base'], [{}]),
+            'DischargeRequest': lambda state, attributes, payload: (['vacuum'], ['start'], [{}]),
+            'SetWaterLevelRequest': lambda state, attributes, payload: _vacuum_water_level(payload),
+            'SetDirectionRequest': lambda state, attributes, payload: _vacuum_direction(payload),
         },
         'switch': {
             'TurnOnRequest': 'turn_on',
@@ -646,9 +864,7 @@ class PlatformParameter:
             'IncrementBrightnessPercentageRequest': lambda state, attributes, payload: (['light'], ['turn_on'], [{'brightness_pct': _resolve_brightness_delta(state, payload, 1)}]),
             'DecrementBrightnessPercentageRequest': lambda state, attributes, payload: (['light'], ['turn_on'], [{'brightness_pct': _resolve_brightness_delta(state, payload, -1)}]),
             'SetColorRequest': lambda state, attributes, payload: (['light'], ['turn_on'], [_resolve_color(state, payload)]),
-            'SetColorTemperatureRequest': lambda state, attributes, payload: (['light'], ['turn_on'], [{'kelvin': _clamp_kelvin(state, _payload_value(payload, 'colorTemperatureInKelvin'))}]),
-            'IncrementColorTemperatureRequest': lambda state, attributes, payload: (['light'], ['turn_on'], [{'kelvin': _resolve_kelvin_delta(state, payload, 1)}]),
-            'DecrementColorTemperatureRequest': lambda state, attributes, payload: (['light'], ['turn_on'], [{'kelvin': _resolve_kelvin_delta(state, payload, -1)}]),
+            **_kelvin_light_handlers(),
         },
         'scene': {
             'TurnOnRequest': 'turn_on',
@@ -670,6 +886,8 @@ class PlatformParameter:
         'AirQualityIndex': {'format': 'aqi', 'read': 'airQuality', 'emit': 'AQI'},
         'State': {'format': 'attribute', 'read': 'state', 'emit': 'state'},
         'Location': {'format': 'location', 'read': 'location', 'emit': 'location'},
+        'ElectricityCapacity': {'format': 'value_scale', 'read': 'electricityCapacity', 'emit': 'electricityCapacity'},
+        'WaterLevel': {'format': 'attribute', 'read': 'waterLevel', 'emit': 'waterLevel'},
     }
 
 
@@ -717,6 +935,9 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         self._store = Store(hass, STORAGE_VERSION, f"{INTEGRATION}_open_uids_{entry.entry_id}")
         self._uid_by_token = {}
         self._report_warn_at = 0.0
+        self._report_at = {}
+        self._report_timers = {}
+        self._sync_at = 0.0
         self._timers = HavcsTimerManager(hass, entry.entry_id)
         self.vcdm = VoiceControlDeviceManager(entry, DOMAIN, self.device_action_map_h2p, self.device_attribute_map_h2p, self._service_map_p2h, self.device_type_map_h2p, self._device_type_alias)
 
@@ -762,15 +983,19 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
     def _errorResult(self, errorCode, messsage=None, payload=None):
         error_code_map = {
             'INVALIDATE_CONTROL_ORDER': 'UnexpectedInformationReceivedError',
+            'INVALIDATE_PARAMS': 'UnexpectedInformationReceivedError',
             'SERVICE_ERROR': 'DriverInternalError',
             'DEVICE_NOT_SUPPORT_FUNCTION': 'UnsupportedOperationError',
-            'INVALIDATE_PARAMS': 'UnsupportedOperationError',
             'DEVICE_IS_NOT_EXIST': 'UnsupportedTargetError',
             'IOT_DEVICE_OFFLINE': 'TargetOfflineError',
             'ACCESS_TOKEN_INVALIDATE': 'InvalidAccessTokenError',
             'ACCESS_TOKEN_EXPIRED': 'ExpiredAccessTokenError',
         }
-        result = {'errorCode': error_code_map.get(errorCode, 'DriverInternalError')}
+        name = error_code_map.get(errorCode, 'DriverInternalError')
+        result = {'errorCode': name}
+        # UnexpectedInformationReceivedError 必须携带 faultingParameter
+        if name == 'UnexpectedInformationReceivedError':
+            payload = payload or {'faultingParameter': {'name': errorCode, 'value': messsage or ''}}
         if payload:
             result['payload'] = payload
         return result
@@ -822,6 +1047,11 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
                         'groupNotes': '',
                         'additionalGroupDetails': {},
                     })
+                    if len(groups) >= _MAX_GROUPS:
+                        break
+                if len(zone_map) > _MAX_GROUPS:
+                    _LOGGER.warning("[%s] discovery: %d groups exceed the %d limit, truncated",
+                                    LOGGER_NAME, len(zone_map), _MAX_GROUPS)
                 result = {'discoveredAppliances': discovery_devices, 'discoveredGroups': groups}
                 await self._async_bind_open_uid(auth, p_user_id)
 
@@ -832,9 +1062,17 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
 
             elif namespace == 'DuerOS.ConnectedHome.Query':
                 if action == 'ReportStateRequest':
-                    err_result, properties = self._handle_report_state(data)
-                    result = err_result if err_result else properties
-                    action = 'ReportStateResponse'
+                    result, action, report_detail = self._handle_report_state(data)
+                    _LOGGER.debug("[%s] ReportState → %s (applianceId=%s, attribute=%s, 命中设备=%s)",
+                                  LOGGER_NAME, action, report_detail['appliance_id'],
+                                  report_detail['attribute'], report_detail['resolved'])
+                    if report_detail['stale']:
+                        # applianceId 已失效：保持 ReportStateResponse 名称以避免小度停止同步，
+                        # 同时触发一次设备同步让平台重新发现设备
+                        _LOGGER.warning(
+                            "[%s] ReportStateRequest 的 applianceId 已失效（按明文或新 ID 均未命中设备），"
+                            "已请求平台重新同步设备；如反复出现请在小度 APP 重新发现设备", LOGGER_NAME)
+                        self._schedule_device_sync()
                 else:
                     err_result, properties = self.process_query_command(data)
                     result = err_result if err_result else properties
@@ -857,6 +1095,8 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
             'payloadVersion': header.get('payloadVersion', '1'),
         }
         if 'errorCode' in result:
+            # 文档规定所有错误消息的 namespace 均为 DuerOS.ConnectedHome.Control
+            response_header['namespace'] = 'DuerOS.ConnectedHome.Control'
             response_header['name'] = result['errorCode']
             result = result.get('payload') or {}
 
@@ -884,11 +1124,11 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
                 actions.append(action)
         return list(set(actions))
 
-    def _discovery_process_propertites(self, device_properties) -> None:
-        return self._build_device_attributes(device_properties)
+    def _discovery_process_propertites(self, device_properties, device=None) -> None:
+        return self._build_device_attributes(device_properties, device=device)
 
-    def _control_process_propertites(self, device_properties, action) -> None:
-        return self._build_device_attributes(device_properties)
+    def _control_process_propertites(self, device_properties, action, device=None) -> None:
+        return self._build_device_attributes(device_properties, device=device)
 
     def _discovery_process_device_info(self, encrypted_id, device_type, device_name, properties, actions, device=None):
         reachable = True
@@ -905,7 +1145,7 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         return {
             'applianceId': encrypted_id,
             'friendlyName': device_name,
-            'friendlyDescription': device_name,
+            'friendlyDescription': f"{device_name}（HomeAssistant 接入，云云对接）"[:128],
             'additionalApplianceDetails': {},
             'applianceTypes': [device_type],
             'isReachable': reachable,
@@ -952,19 +1192,63 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         state = self._hass.states.get(entity_id)
         return name, self._read_attribute_value(name, state, attr_key, entity_id), entity_id
 
-    def _build_device_attributes(self, device_properties, requested=None, limit=MAX_ATTRIBUTES) -> list:
+    def _build_device_attributes(self, device_properties, requested=None, limit=MAX_ATTRIBUTES,
+                                 device=None) -> list:
+        """构造属性列表；requested 可含未声明属性（ReportState 要求必含被请求项）。"""
+        names = set()
+        if isinstance(requested, str):
+            names = {requested}
+        elif isinstance(requested, (list, tuple, set)):
+            names = {requested_name for requested_name in requested if requested_name}
+
         items = []
         seen = set()
         for device_property in device_properties:
-            name, value, _ = self._read_property(device_property)
-            if not name or name in seen or value is None:
+            attr_name, value, _ = self._read_property(device_property)
+            if not attr_name or attr_name in seen or value is None:
                 continue
-            seen.add(name)
-            meta = self._dueros_attr_meta.get(name, {'scale': '', 'legalValue': 'STRING'})
-            items.append(self._attribute_item(name, value, meta))
-        if requested:
-            items.sort(key=lambda item: item['name'] != requested)
-        return items[:limit] or [self._attribute_item('turnOnState', 'OFF', self._dueros_attr_meta['turnOnState'])]
+            seen.add(attr_name)
+            items.append(self._scalar_attribute(attr_name, value))
+
+        # 设备级属性（location）随发现与回读一并上报
+        for attr_name in ('location',):
+            if attr_name in seen or device is None:
+                continue
+            value = self._read_device_attribute(attr_name, device)
+            if value is not None:
+                seen.add(attr_name)
+                items.append(self._scalar_attribute(attr_name, value))
+
+        for attr_name in names - seen:
+            value = self._read_device_attribute(attr_name, device) if device is not None else None
+            if value is not None:
+                items.append(self._scalar_attribute(attr_name, value))
+
+        if names:
+            items.sort(key=lambda item: item['name'] not in names)
+        return items[:limit] or [self._scalar_attribute('turnOnState', 'OFF')]
+
+    def _scalar_attribute(self, name, value) -> dict:
+        meta = self._dueros_attr_meta.get(name, {'scale': '', 'legalValue': 'STRING'})
+        return self._attribute_item(name, value, meta)
+
+    def _read_device_attribute(self, dueros_name, device):
+        """读取不依赖实体状态的设备级属性（location/waterLevel）。"""
+        if dueros_name == 'location':
+            return self._resolve_location(device)
+        if dueros_name == 'waterLevel':
+            for device_property in device.properties:
+                if device_property.get('attribute') != 'waterlevel':
+                    continue
+                state = self._hass.states.get(device_property.get('entity_id'))
+                return _resolve_water_level_value(state)
+        return None
+
+    def _resolve_location(self, device):
+        zone = device.attributes.get(ATTR_DEVICE_ZONE) if device else None
+        if not zone or zone == '未指定':
+            return None
+        return _LOCATION_ENUM.get(zone, zone)
 
     def _read_attribute_value(self, dueros_name, state, attr_key, entity_id):
         """读取 HA 状态并转换为 DuerOS 属性值。"""
@@ -996,8 +1280,13 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         if dueros_name == 'mode':
             if domain == 'climate':
                 return self.ha_to_dueros_climate_mode.get(state.attributes.get('hvac_mode') or state.state, 'AUTO')
-            if domain in ('fan', 'humidifier'):
+            if domain == 'fan':
+                swing = _mode_to_swing(state.attributes.get('oscillating'))
+                return swing or state.attributes.get('preset_mode')
+            if domain == 'humidifier':
                 return state.attributes.get('preset_mode') or state.attributes.get('mode') or None
+            if domain == 'vacuum':
+                return state.attributes.get('cleaning_mode') or None
             return None
         if dueros_name == 'fanSpeed':
             if domain == 'climate':
@@ -1037,6 +1326,10 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
             return value if isinstance(value, bool) else None
         if dueros_name == 'suction':
             return _resolve_suction(state.attributes.get('fan_speed'))
+        if dueros_name == 'electricityCapacity':
+            return _resolve_electricity_capacity(state)
+        if dueros_name == 'waterLevel':
+            return _resolve_water_level_value(state)
         if dueros_name == 'warmthLevel':
             preset = str(state.attributes.get('preset_mode') or '')
             if not preset:
@@ -1102,14 +1395,42 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
             payload['temperatureMode'] = {'value': mode, 'friendlyName': mode}
         return payload
 
-    def _handle_report_state(self, data):
-        """Handle ReportStateRequest from Xiaodu (callback after ChangeReportRequest)."""
-        device_id = self._decrypt_device_id(self._prase_command(data, 'device_id'))
-        device = self.vcdm.get(device_id) if device_id else None
+    def _handle_report_state(self, data) -> tuple:
+        """处理 ReportStateRequest，返回 (payload, 响应名, 诊断信息)。
+
+        无论成败都保留 ReportStateResponse 作为响应名：若被替换为错误名，
+        小度会返回 21096 并停止该设备的属性同步。
+        """
+        raw_id = self._prase_command(data, 'device_id')
+        device = self._get_device(raw_id)
+        attribute = ((data.get('payload') or {}).get('appliance') or {}).get('attributeName')
+        detail = {'appliance_id': raw_id, 'attribute': attribute,
+                  'resolved': device.device_id if device else None,
+                  'stale': device is None}
         if device is None:
-            return self._errorResult('DEVICE_IS_NOT_EXIST'), None
-        requested = ((data.get('payload') or {}).get('appliance') or {}).get('attributeName')
-        return None, {'attributes': self._build_device_attributes(device.properties, requested=requested)}
+            return {'attributes': []}, 'ReportStateResponse', detail
+        return ({'attributes': self._build_device_attributes(device.properties, requested=attribute, device=device)},
+                'ReportStateResponse', detail)
+
+    def _get_device(self, raw_id):
+        """按 applianceId 取设备：先按配置的加密方式解出，再回退明文 ID。"""
+        if not raw_id:
+            return None
+        device = self.vcdm.get(self._decrypt_device_id(raw_id))
+        if device is None:
+            device = self.vcdm.get(raw_id)
+        if device is None:
+            self.vcdm.all(self._hass)
+            device = self.vcdm.get(self._decrypt_device_id(raw_id)) or self.vcdm.get(raw_id)
+        return device
+
+    def _schedule_device_sync(self) -> None:
+        """限频触发一次设备同步（applianceId 失效时让平台重新发现）。"""
+        now = time.monotonic()
+        if now - self._sync_at < _SYNC_MIN_INTERVAL:
+            return
+        self._sync_at = now
+        self._hass.async_create_task(self.sync_devices(self._hass))
 
     # ------------------------------------------------------------- 控制处理
 
@@ -1173,18 +1494,35 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         else:
             _LOGGER.debug(message, LOGGER_NAME, action, status, _shorten(result))
 
-    async def report_device(self, hass, device_id, changed_attribute='turnOnState'):
-        """Send ChangeReportRequest to Xiaodu when device state changes."""
+    async def report_device(self, hass, device_id, changed_attribute='turnOnState') -> bool:
+        """Send ChangeReportRequest to Xiaodu when device state changes.
+
+        小度对同一属性有 60 秒内仅同步 1 次的限制（status=21207），
+        因此窗口内的变更合并为一次延迟补发，避免被拒后状态长期不同步。
+        """
         open_uids = self._open_uids()
         if not open_uids:
             _LOGGER.debug("[%s] no openUids cached, skip report", LOGGER_NAME)
-            return
+            return False
 
         device = self.vcdm.get(device_id)
+        if changed_attribute not in self._device_reportable_attributes(device):
+            _LOGGER.debug("[%s] %s is not reportable for %s", LOGGER_NAME, changed_attribute, device_id)
+            return False
+
         dueros_attr = self.ha_attribute_to_dueros.get(changed_attribute, 'turnOnState')
         if changed_attribute == 'state' and device is not None and any(entity_id.startswith('vacuum.') for entity_id in device.entity_id):
             dueros_attr = 'state'
 
+        key = (device_id, dueros_attr)
+        now = time.time()
+        elapsed = now - self._report_at.get(key, 0.0)
+        if elapsed < _CHANGE_REPORT_INTERVAL:
+            self._schedule_report_flush(hass, device_id, changed_attribute, dueros_attr, _CHANGE_REPORT_INTERVAL - elapsed)
+            return False
+
+        self._report_at[key] = now
+        attempted = False
         for p_user_id in open_uids:
             report = {
                 "header": {
@@ -1208,7 +1546,52 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
             except Exception:
                 _LOGGER.error("[%s] failed to send ChangeReport: %s", LOGGER_NAME, traceback.format_exc())
                 continue
+            attempted = True
             self._log_upstream_result('ChangeReport', status, result)
+            if isinstance(result, dict) and result.get('status') == _SYNC_STATUS_RATE_LIMITED:
+                # 小度已按 60 秒窗口计数，重排一次补发而不是丢弃
+                self._schedule_report_flush(hass, device_id, changed_attribute, dueros_attr, _CHANGE_REPORT_INTERVAL)
+            elif isinstance(result, dict) and result.get('status') == _SYNC_STATUS_NAME_MISMATCH:
+                _LOGGER.warning(
+                    "[%s] ChangeReport rejected (%s): 服务端未收到 ReportStateResponse，"
+                    "请检查 ReportStateRequest 处理链路（device_id=%s, attribute=%s）",
+                    LOGGER_NAME, result.get('status'), device_id, dueros_attr)
+        return attempted
+
+    def _schedule_report_flush(self, hass, device_id, changed_attribute, dueros_attr, delay) -> None:
+        """窗口内合并变更：到期后补发一次最新状态。"""
+        key = (device_id, dueros_attr)
+        if key in self._report_timers:
+            return
+        loop = hass.loop
+        handle = loop.call_later(delay + 1.0, self._async_flush_report, hass, device_id, changed_attribute, dueros_attr)
+        self._report_timers[key] = handle
+
+    @callback
+    def _async_flush_report(self, hass, device_id, changed_attribute, dueros_attr) -> None:
+        self._report_timers.pop((device_id, dueros_attr), None)
+        hass.async_create_task(self.report_device(hass, device_id, changed_attribute))
+
+    def _device_reportable_attributes(self, device) -> set:
+        """计算设备可上报的 HA 属性名（与发现/上报的映射保持一致）。"""
+        if device is None:
+            return set()
+        reportable = set()
+        for entity_id in device.entity_id:
+            domain = entity_id.split('.', 1)[0]
+            if domain == 'sensor':
+                continue
+            if domain == 'vacuum':
+                reportable |= {'state', 'fan_speed', 'battery_level'}
+                continue
+            for device_property in device.properties:
+                if device_property.get('entity_id') != entity_id:
+                    continue
+                dueros_name = self.device_attribute_map_h2p.get(device_property.get('attribute'))
+                for key, name in self.ha_attribute_to_dueros.items():
+                    if name == dueros_name:
+                        reportable.add(key)
+        return reportable
 
     async def sync_devices(self, hass):
         """Notify Xiaodu to re-discover devices via devicesync API."""

@@ -4,12 +4,14 @@ import traceback
 
 import voluptuous as vol
 
+from homeassistant.components.homeassistant.exposed_entities import async_should_expose
 from homeassistant.core import Context, HomeAssistant, callback
 from homeassistant.exceptions import ServiceNotFound
 from homeassistant.helpers import area_registry, device_registry, entity_registry
 from homeassistant.helpers.event import async_track_state_change_event
 
 from .const import (
+    ASSISTANT_CONVERSATION,
     ATTR_DEVICE_ACTIONS,
     ATTR_DEVICE_ENTITY_ID,
     ATTR_DEVICE_ID,
@@ -17,7 +19,6 @@ from .const import (
     ATTR_DEVICE_PROPERTIES,
     ATTR_DEVICE_TYPE,
     ATTR_DEVICE_ZONE,
-    DEFAULT_EXPOSED_DOMAINS,
     DEVICE_ID_PREFIX,
     HAVCS_SUPPORTED_DOMAINS,
 )
@@ -32,12 +33,14 @@ CONTEXT = Context()
 
 # 设备的调色/调色温能力判定所用色模式
 _COLOR_MODES = ('hs', 'rgb', 'rgbw', 'rgbww', 'xy')
+# 水量/水箱控制实体的名称关键字（扫地机拖地水量）
+_WATER_WORDS = ('水量', '水箱', 'water', 'mop')
 _NAME_FORBIDDEN = str.maketrans({c: None for c in "!@#$%^&*()_+=~`[]{}\\|;:'\"<>,.?/-"
                                               "（）【】《》「」『』、，。；：！？·…—～＃＠￥％＆＊＋＝｜"})
 
 
 class VoiceControlProcessor:
-    def _discovery_process_propertites(self, device_properties) -> None:
+    def _discovery_process_propertites(self, device_properties, device=None) -> None:
         raise NotImplementedError()
 
     def _discovery_process_actions(self, device_properties, raw_actions) -> None:
@@ -49,7 +52,7 @@ class VoiceControlProcessor:
     def _discovery_process_device_info(self, device_id, device_type, device_name, zone, properties, actions, device=None) -> None:
         raise NotImplementedError()
 
-    def _control_process_propertites(self, device_properties, action) -> None:
+    def _control_process_propertites(self, device_properties, action, device=None) -> None:
         raise NotImplementedError()
 
     def _query_process_propertites(self, device_properties, action, device=None) -> None:
@@ -89,7 +92,7 @@ class VoiceControlProcessor:
         zone_map = {}  # {zone_name: [applianceId, ...]}
         for vc_device in self.vcdm.all(self._hass):
             device_id, raw_device_type, device_name, zone, device_properties, raw_actions = self.vcdm.get_device_attrs(vc_device.attributes)
-            properties = self._discovery_process_propertites(device_properties)
+            properties = self._discovery_process_propertites(device_properties, vc_device)
             actions = self._discovery_process_actions(device_properties, raw_actions)
             device_type = self._discovery_process_device_type(raw_device_type)
             if None in (device_type, device_name) or [] in (properties, actions):
@@ -167,7 +170,7 @@ class VoiceControlProcessor:
 
         await self._async_wait_state_change(entity_ids)
         device_properties = self.vcdm.get(device_id).properties
-        properties = self._control_process_propertites(device_properties, action)
+        properties = self._control_process_propertites(device_properties, action, device)
         return None, properties
 
     async def _async_wait_state_change(self, entity_ids, timeout=1.0):
@@ -219,8 +222,7 @@ class VoiceControlDeviceManager:
 
     @staticmethod
     def get_exposed_entities(hass: HomeAssistant) -> dict:
-        """Build device entries from HA voice assistant exposed entities."""
-        er = entity_registry.async_get(hass)
+        """Build device entries from entities exposed to the voice assistant."""
         exposed_items = {}
 
         for state in hass.states.async_all():
@@ -230,20 +232,7 @@ class VoiceControlDeviceManager:
             if domain not in HAVCS_SUPPORTED_DOMAINS:
                 continue
 
-            entry = er.async_get(entity_id)
-            if entry is None:
-                continue
-
-            if entry.hidden_by is not None:
-                continue
-
-            conversation_options = entry.options.get("conversation", {})
-            if "should_expose" in conversation_options:
-                should_expose = conversation_options["should_expose"]
-            else:
-                should_expose = domain in DEFAULT_EXPOSED_DOMAINS
-
-            if not should_expose:
+            if not async_should_expose(hass, ASSISTANT_CONVERSATION, entity_id):
                 continue
 
             object_id = entity_id.split('.', 1)[1]
@@ -282,7 +271,7 @@ class VoiceControlDeviceManager:
             if device_name is None:
                 device_name = self.get_device_name(hass, entity_id, self._device_name_constraints)
             if device_type is None:
-                device_type = self.get_device_type(hass, entity_id, device_name)
+                device_type = self.get_device_type(hass, entity_id, device_name, self.device_type_map_h2p)
             if zone is None:
                 zone = self.get_device_zone(hass, entity_id, self._places, self._zone_constraints)
             properties += self.get_device_properties(hass, entity_id)
@@ -336,20 +325,27 @@ class VoiceControlDeviceManager:
                 entity_ids.append(entity_id)
         return entity_ids
 
-    def get_device_type(self, hass, entity_id, device_name) -> str:
-        if device_name:
-            for device_type, alias in self._device_type_alias.items():
-                if alias in device_name:
-                    return device_type
+    def get_device_type(self, hass, entity_id, device_name, domain_map=None) -> str:
+        """解析设备类型：先按实体域映射，再按名称别名（取最长匹配）。
+
+        名称别名必须在域映射之后判断，否则 vacuum 会被别名 ROBOT（SWEEPING_ROBOT 的子串）截胡。
+        """
+        domain = entity_id[:entity_id.find('.')] if '.' in entity_id else entity_id
+        if domain_map and domain in domain_map:
+            return domain
+
+        names = [device_name]
         state = hass.states.get(entity_id)
-        if state and state.attributes.get('friendly_name'):
+        if state:
+            names.append(state.attributes.get('friendly_name'))
+        best = None
+        for name in names:
+            if not name:
+                continue
             for device_type, alias in self._device_type_alias.items():
-                if alias in state.attributes.get('friendly_name'):
-                    return device_type
-        for device_type in self._device_type_alias.keys():
-            if device_type.lower() in entity_id:
-                return device_type
-        return entity_id[:entity_id.find('.')]
+                if alias in name and (best is None or len(alias) > len(self._device_type_alias[best])):
+                    best = device_type
+        return best or domain
 
     def get_device_name(self, hass, entity_id, device_name_constraints=[]) -> str:
         state = hass.states.get(entity_id)
@@ -480,6 +476,11 @@ class VoiceControlDeviceManager:
             state = hass.states.get(entity_id)
             if state and state.attributes.get('fan_speed'):
                 properties.append({'entity_id': entity_id, 'attribute': 'suction'})
+            if state and state.attributes.get('battery_level') is not None:
+                properties.append({'entity_id': entity_id, 'attribute': 'electricitycapacity'})
+            water_attribute = self._get_water_property(hass, entity_id)
+            if water_attribute:
+                properties.append(water_attribute)
         elif entity_id.startswith('scene.'):
             properties = [{'entity_id': entity_id, 'attribute': 'turnonstate'}]
         else:
@@ -504,7 +505,8 @@ class VoiceControlDeviceManager:
         elif device_type == 'humidifier':
             actions = ["turn_on", "turn_off", "timing_turn_on", "timing_turn_off", "query_turnonstate", "set_humidity", "query_humidity", "query_targethumidity"]
         elif device_type == 'vacuum':
-            actions = ["turn_on", "turn_off", "timing_turn_on", "timing_turn_off", "query_turnonstate", "query_state"]
+            actions = ["turn_on", "turn_off", "timing_turn_on", "timing_turn_off", "query_turnonstate", "query_state",
+                       "set_suction", "set_mode", "query_electricitycapacity", "set_waterlevel", "query_waterlevel"]
         elif device_type == 'fan':
             actions = ["turn_on", "turn_off", "timing_turn_on", "timing_turn_off", "query_turnonstate", "set_percentage", "increase_speed", "decrease_speed", "set_oscillate", "unset_oscillate", "query_fanspeed"]
         elif device_type == 'YUBA':
@@ -526,7 +528,8 @@ class VoiceControlDeviceManager:
         elif entity_id.startswith('humidifier.'):
             actions = ["turn_on", "turn_off", "timing_turn_on", "timing_turn_off", "query_turnonstate", "set_humidity", "query_humidity", "query_targethumidity"]
         elif entity_id.startswith('vacuum.'):
-            actions = ["turn_on", "turn_off", "timing_turn_on", "timing_turn_off", "query_turnonstate", "query_state"]
+            actions = ["turn_on", "turn_off", "timing_turn_on", "timing_turn_off", "query_turnonstate", "query_state",
+                       "set_suction", "set_mode", "query_electricitycapacity", "set_waterlevel", "query_waterlevel"]
         elif entity_id.startswith('fan.'):
             state = hass.states.get(entity_id)
             friendly_name = state.attributes.get('friendly_name', '') if state else ''
@@ -581,11 +584,30 @@ class VoiceControlDeviceManager:
                 removed |= {'set_oscillate', 'unset_oscillate'}
         elif entity_id.startswith('climate.'):
             if not attrs.get('fan_modes'):
-                removed |= {'set_percentage', 'increase_speed', 'decrease_speed', 'query_fanspeed'}
+                removed |= {'query_fanspeed'}
         elif entity_id.startswith('vacuum.'):
+            from homeassistant.components.vacuum import VacuumEntityFeature
+            features = int(attrs.get('supported_features', 0))
             if not attrs.get('fan_speed_list'):
                 removed |= {'set_suction'}
+            if not features & VacuumEntityFeature.START:
+                removed |= {'set_mode'}
+            if not any('waterlevel' == p.get('attribute') for p in self.get_device_properties(hass, entity_id)):
+                removed |= {'set_waterlevel', 'query_waterlevel'}
         return [a for a in actions if a not in removed]
 
     def get_sensor_actions_from_properties(self, properties) -> list:
         return ['query_' + device_property.get('attribute') for device_property in properties if device_property.get('attribute')]
+
+    def _get_water_property(self, hass, vacuum_entity_id) -> dict | None:
+        """查找与扫地机同区域的水量控制实体（number 域），用于 waterLevel 属性。"""
+        key = vacuum_entity_id.split('.', 1)[1]
+        for state in hass.states.async_all():
+            if not state.entity_id.startswith('number.'):
+                continue
+            name = str(state.attributes.get('friendly_name') or '')
+            if not any(word in name for word in _WATER_WORDS):
+                continue
+            if key in state.entity_id or key in name:
+                return {'entity_id': state.entity_id, 'attribute': 'waterlevel'}
+        return None

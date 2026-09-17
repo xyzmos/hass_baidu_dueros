@@ -15,6 +15,7 @@ from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
 
 from . import util as havcs_util
 from .const import (
@@ -26,6 +27,8 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 LOGGER_NAME = 'http'
+
+STORAGE_VERSION = 1
 
 _MAX_LOGIN_ATTEMPTS = 5
 _LOGIN_WINDOW = 60.0
@@ -262,6 +265,8 @@ class HavcsTokenView(HomeAssistantView):
     def __init__(self, hass, expiration):
         self._hass = hass
         self._expiration = expiration
+        self._store = Store(hass, STORAGE_VERSION, f"{INTEGRATION}_client_ids")
+        self._client_ids = {}
 
     @property
     def _token_url(self):
@@ -272,19 +277,38 @@ class HavcsTokenView(HomeAssistantView):
     def _clients(self):
         return self._hass.data.get(INTEGRATION, {}).get(DATA_HAVCS_CONFIG, {}).get('http', {}).get('clients', {})
 
+    async def async_setup_client_ids(self):
+        """恢复 refresh_token → client_id 映射（HA 要求刷新时 client_id 与签发时完全一致）。"""
+        self._client_ids = await self._store.async_load() or {}
+
+    async def _async_latch_client_id(self, refresh_token, client_id):
+        if not refresh_token or not client_id or self._client_ids.get(refresh_token) == client_id:
+            return
+        self._client_ids[refresh_token] = client_id
+        await self._store.async_save(self._client_ids)
+
     @staticmethod
-    def _forward_client_id(client_id, redirect_uri):
-        """归一化转发给 HA 的 client_id：必须与授权码绑定的 client_id 一致。"""
-        if client_id.startswith('https://'):
+    def _normalize_client_id(client_id, redirect_uri):
+        """把 小度 传来的 client_id 归一化为 HA 可校验的 URL 形式。"""
+        if client_id and client_id.startswith('https://'):
             return client_id
         parts = urlparse(redirect_uri) if redirect_uri else None
         host = f"{parts.scheme}://{parts.netloc}" if parts and parts.scheme and parts.netloc else ''
         if host in CLIENT_PLATFORM_DICT.values():
             return host
         for platform in sorted(CLIENT_PLATFORM_DICT, key=len, reverse=True):
-            if client_id.startswith(platform):
+            if client_id and client_id.startswith(platform):
                 return CLIENT_PLATFORM_DICT[platform]
         return CLIENT_PLATFORM_DICT['dueros']
+
+    def _forward_client_id(self, client_id, redirect_uri, refresh_token=None):
+        """确定转发给 HA 的 client_id。
+
+        刷新时必须沿用签发该 refresh_token 时使用的 client_id，否则 HA 返回 invalid_request。
+        """
+        if refresh_token and self._client_ids.get(refresh_token):
+            return self._client_ids[refresh_token]
+        return self._normalize_client_id(client_id, redirect_uri)
 
     async def get(self, request):
         return web.Response(body='404 Not Found', status=404)
@@ -307,6 +331,7 @@ class HavcsTokenView(HomeAssistantView):
         client_id = data.get('client_id')
         client_secret = data.get('client_secret')
         redirect_uri = data.get('redirect_uri')
+        refresh_token = data.get('refresh_token')
         clients = self._clients()
 
         if not self._token_url:
@@ -324,17 +349,21 @@ class HavcsTokenView(HomeAssistantView):
                 return web.Response(body='401 Unauthorized', status=401)
             data['client_id'] = self._forward_client_id(client_id, redirect_uri)
         elif grant_type == 'refresh_token':
-            if not data.get('refresh_token'):
+            if not refresh_token:
+                _LOGGER.error("[%s][auth] refresh request without refresh_token", LOGGER_NAME)
                 return web.Response(body='400 Bad Request', status=400)
             if client_id:
                 stored_secret = clients.get(client_id)
                 if stored_secret is None or (client_secret and client_secret != stored_secret):
                     _LOGGER.error("[%s][auth] invalid client on refresh (client_id=%s)", LOGGER_NAME, client_id)
                     return web.Response(body='401 Unauthorized', status=401)
-                data['client_id'] = self._forward_client_id(client_id, redirect_uri)
+            data['client_id'] = self._forward_client_id(client_id, redirect_uri, refresh_token)
         else:
             _LOGGER.error("[%s][auth] unsupported grant_type: %s", LOGGER_NAME, grant_type)
             return web.Response(body='400 Unsupported Grant Type', status=400)
+
+        _LOGGER.debug("[%s][auth] %s → HA: client_id=%s (incoming=%s, redirect_uri=%s)",
+                      LOGGER_NAME, grant_type, data.get('client_id'), client_id, bool(redirect_uri))
 
         session = async_get_clientsession(self._hass)
         try:
@@ -353,11 +382,12 @@ class HavcsTokenView(HomeAssistantView):
             _LOGGER.error("[%s][auth] invalid token response (status=%s)", LOGGER_NAME, response.status)
             return web.Response(status=response.status if response.status >= 400 else 500)
         if not isinstance(result, dict) or not result.get('access_token'):
-            _LOGGER.error("[%s][auth] token exchange failed: %s", LOGGER_NAME, result)
+            self._log_token_failure(grant_type, data.get('client_id'), result, response.status)
             return web.Response(status=response.status if response.status >= 400 else 400)
 
         if grant_type == 'authorization_code':
             extended = havcs_util.update_token_expiration(result['access_token'], self._hass, self._expiration)
+            await self._async_latch_client_id(result.get('refresh_token'), data['client_id'])
             if extended:
                 refreshed = await self._async_refresh(session, data.get('client_id'), result.get('refresh_token'))
                 if refreshed and refreshed.get('access_token'):
@@ -371,8 +401,21 @@ class HavcsTokenView(HomeAssistantView):
                 result['expires_in'] = int(result.get('expires_in', 1800))
             return self.json(result)
 
-        result['refresh_token'] = data.get('refresh_token')
+        await self._async_latch_client_id(refresh_token, data['client_id'])
+        result['refresh_token'] = refresh_token
         return self.json(result)
+
+    @staticmethod
+    def _log_token_failure(grant_type, client_id, result, status):
+        """记录 HA 拒绝原因（区分 client_id 不一致 / client_id 非法 / token 无效）。"""
+        error = result.get('error') if isinstance(result, dict) else result
+        description = result.get('error_description') if isinstance(result, dict) else None
+        _LOGGER.error("[%s][auth] token exchange failed (%s): client_id=%s, error=%s, description=%s",
+                      LOGGER_NAME, grant_type, client_id, error, description)
+        if error == 'invalid_request':
+            _LOGGER.error(
+                "[%s][auth] HA 拒绝原因通常是 client_id 与签发 refresh_token 时不一致或格式非法；"
+                "如反复出现，请在小度 APP 重新绑定设备以重新签发 token", LOGGER_NAME)
 
     async def _async_refresh(self, session, client_id, refresh_token):
         """用 refresh_token 重新签发 access token（使新有效期生效）。"""
@@ -413,6 +456,8 @@ class HavcsHttpManager:
         for key, view in views.items():
             if key in cache:
                 _LOGGER.debug("[%s] view %s already registered, reuse existing instance", LOGGER_NAME, key)
-                continue
-            self._hass.http.register_view(view)
-            cache[key] = view
+            else:
+                self._hass.http.register_view(view)
+                cache[key] = view
+            if key == 'token':
+                self._hass.async_create_task(cache[key].async_setup_client_ids())

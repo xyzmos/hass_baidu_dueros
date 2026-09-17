@@ -14,7 +14,7 @@ Home Assistant 自定义集成：通过小度开放平台「智能家居 → HTT
 ## 特性
 
 - **全流程自建**：OAuth2 授权页、Token 签发、技能服务端点均由集成自身提供，不依赖第三方中转服务；
-- **复用 HA 暴露机制**：直接使用官方「语音助手」暴露设置，无需维护额外白名单；
+- **复用 HA 暴露机制**：暴露范围与官方「语音助手」（Assist）设置完全一致，无需维护额外白名单；
 - **多域支持**：`climate`、`cover`、`fan`、`humidifier`、`light`、`media_player`、`scene`、`switch`、`vacuum`、`sensor`；
 - **房间分组**：自动识别实体区域（HA 区域 → 设备区域 → 名称前缀），以小度「设备分组」同步，可按房间语音控制；
 - **状态主动上报**：HA 实体状态变化时推送 `ChangeReportRequest`，小度 APP 状态实时同步；
@@ -75,12 +75,14 @@ Home Assistant 自定义集成：通过小度开放平台「智能家居 → HTT
 
 ## 设备暴露
 
-集成复用 HA 官方「语音助手」暴露设置，无需单独维护设备清单：
+集成不维护独立的设备清单，暴露范围完全等同 Home Assistant 的「暴露给语音助手」设置（以 Assist 助手，即 `conversation` 的开关为准，判定直接调用 HA 官方接口）：
 
 - 在实体的 **设置 → 语音助手** 中勾选/取消「暴露」，即可控制是否同步到小度；
-- 默认暴露域：`climate`、`cover`、`fan`、`humidifier`、`light`、`media_player`、`scene`、`switch`、`vacuum`；
-- `sensor` 默认不暴露，需在实体设置中手动开启；
-- 隐藏（hidden）的实体不会被暴露；
+- 未手动设置过的实体按 HA 默认规则判定：
+  - 默认暴露域：`climate`、`cover`、`fan`、`humidifier`、`light`、`media_player`、`scene`、`switch`、`vacuum`（HA 还会默认暴露 `todo`、`water_heater`，本集成不支持）；
+  - `sensor` 按设备类别默认暴露：温度、湿度、PM2.5、PM10、CO₂、空气质量、挥发性有机物，其余（电量、信号强度等）需在实体设置中手动开启；
+  - 诊断/配置类实体（`entity_category` 非空）与已隐藏（hidden）的实体默认不暴露；
+- 即使已暴露，也只有本集成支持的域会被同步到小度：`climate`、`cover`、`fan`、`humidifier`、`light`、`media_player`、`scene`、`switch`、`vacuum`、`sensor`；
 - 修改暴露设置后，集成会自动重建缓存（约 2 秒防抖）并通知小度重新发现设备。
 
 设备名称取实体的 `friendly_name`（清除标点、限制 128 字符）；区域判定顺序：
@@ -102,10 +104,12 @@ Home Assistant 自定义集成：通过小度开放平台「智能家居 → HTT
 | `fan` | FAN / YUBA（名称含「浴霸」） | 开关、风速、摆风 / 档位、模式 |
 | `humidifier` | HUMIDIFIER | 开关、目标湿度查询与设置 |
 | `media_player` | TV_SET | 开关、播放 / 暂停、音量调节与静音 |
-| `vacuum` | SWEEPING_ROBOT | 启动、回充、状态查询、吸力设置 |
+| `vacuum` | SWEEPING_ROBOT | 启动、回充、暂停、模式、吸力、水量、电量与状态查询 |
 | `scene` | SCENE_TRIGGER | 场景激活 |
 
 > 指令会按实体实际能力裁剪：例如灯不支持色温时不会暴露色温指令，`media_player` 不支持音量调节时不会暴露音量指令。
+
+灯的色温指令使用 `light.turn_on` 的 `color_temp_kelvin` 参数下发，色温值按设备实际范围（`min_color_temp_kelvin` / `max_color_temp_kelvin`）钳制，避免超出灯带支持区间导致调用失败。
 
 ## 提供的服务
 
@@ -118,10 +122,19 @@ Home Assistant 自定义集成：通过小度开放平台「智能家居 → HTT
 
 **小度 APP 中看不到设备？**
 
-1. 确认实体已在「语音助手」中暴露（`sensor` 需手动开启）；
+1. 确认实体在「语音助手」（Assist）中处于暴露状态，且实体所属域在集成支持范围内；
 2. 调用 `hass_baidu_dueros.reload` 服务或重启 HA；
 3. 在小度 APP 中重新「发现设备」；
 4. 查看日志中的 `[init] loaded N exposed devices` 与发现结果。
+
+**运行一段时间后提示「设备绑定账号已失效，请重新绑定」？**
+
+该提示来自小度，成因是它刷新 access token 失败。集成已做两处防护：
+
+1. 刷新时沿用签发 refresh_token 时登记的 `client_id`（HA 要求两者完全一致，否则返回 `invalid_request`），映射持久化在 `.storage/hass_baidu_dueros_client_ids`，HA 重启后仍生效；
+2. 上报被拒时的日志会带上 HA 的 `error` 与 `error_description`，可直接区分 `client_id` 不一致、`client_id` 非法与 token 失效。
+
+若日志中出现 `token exchange failed ... error=invalid_grant`，说明 refresh_token 已不存在（例如小度侧解绑、HA 侧令牌被删除），此时按提示重新绑定即可。
 
 **授权时提示「该 HA 账号启用了两步验证（MFA）」？**
 
@@ -134,6 +147,10 @@ Home Assistant 自定义集成：通过小度开放平台「智能家居 → HTT
 **小度 APP 状态不同步？**
 
 主动上报依赖首次授权后缓存的 `openUid`，请先在小度 APP 完成一次绑定与设备发现。若仍不生效，可在日志中检索 `ChangeReport` 的返回结果排查。
+
+日志出现 `status: 21207`（`One attribute can only sync 1 times during 60`）说明小度对同一属性有 60 秒一次的同步限制；集成会自动把窗口内的多次变更合并为一次延迟补发，属正常限流，无需处理。
+
+日志出现 `status: 21096`（`Cloud response name is not ReportStateResponse`）表示小度回查设备属性时未得到 `ReportStateResponse`。集成现已保证该响应名恒定（即使属性读取失败也不替换为错误名），并会在 applianceId 失效时自动触发一次设备同步；若仍反复出现，请在小度 APP 重新发现设备。
 
 **修改「设备 ID 加密密钥」后设备全部失效？**
 
@@ -163,7 +180,11 @@ logger:
 
 - 设备 ID 默认格式为 `hbd_<domain>_<object_id>`，配置加密密钥后为 AES 加密串；
 - 设备状态上报 `ChangeReportRequest` 与设备同步 `devicesync` 直连小度开放平台接口；
-- 定时任务以 `(entity_id, 开/关方向)` 为键持久化，HA 重启后自动恢复，同方向重复设定以最后一次为准。
+- 定时任务以 `(entity_id, 开/关方向)` 为键持久化，HA 重启后自动恢复，同方向重复设定以最后一次为准；
+- 错误消息统一使用 `DuerOS.ConnectedHome.Control` 命名空间（协议规定），参数类错误返回 `UnexpectedInformationReceivedError` 并携带 `faultingParameter`；
+- 属性上报按「设备属性」白名单转换（传感器不上报 `turnOnState`，风扇 `oscillating` 上报为 `SWING`/`STOP`），并按 60 秒窗口做同属性合流；
+- `ReportStateResponse` 会返回小度请求的属性（含 `location`、`electricityCapacity` 等非实体属性）；
+- 单次发现：设备上限 300、分组上限 10、每组设备上限 50、每设备属性上限 10。
 
 ## 许可证
 
