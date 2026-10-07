@@ -7,9 +7,10 @@
 Home Assistant 自定义集成：通过小度开放平台「智能家居 → HTTP 自建技能」，把 HA 中的实体接入小度音箱，实现语音控制、状态查询与状态主动上报。
 
 [![通过 HACS 添加仓库](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=xyzmos&repository=hass_baidu_dueros&category=integration)
+[![GitHub Release](https://img.shields.io/github/v/release/xyzmos/hass_baidu_dueros)](https://github.com/xyzmos/hass_baidu_dueros/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-仓库地址：
-- GitHub：<https://github.com/xyzmos/hass_baidu_dueros>
+仓库地址：<https://github.com/xyzmos/hass_baidu_dueros>
 
 ## 特性
 
@@ -40,8 +41,8 @@ Home Assistant 自定义集成：通过小度开放平台「智能家居 → HTT
 
 ### 手动安装
 
-1. 从上述任一仓库下载源码；
-2. 将 `custom_components/hass_baidu_dueros` 整个目录放入 HA 配置目录的 `config/custom_components/` 下；
+1. 从 [Releases](https://github.com/xyzmos/hass_baidu_dueros/releases) 下载 `hass_baidu_dueros.zip`（或克隆源码）；
+2. 解压并将 `hass_baidu_dueros` 目录放入 HA 配置目录的 `config/custom_components/` 下；
 3. 重启 Home Assistant。
 
 ## 配置
@@ -169,6 +170,23 @@ logger:
 ```
 
 日志中所有 `access_token` / `token` 均会自动脱敏（仅保留前 6 位）。
+
+## 发布新版本（维护者）
+
+发布流程由 `.github/workflows/release.yaml` 自动完成：
+
+1. 修改 `custom_components/hass_baidu_dueros/manifest.json` 中的 `version` 字段（如 `2025.10.0`）；
+2. 提交并推送 main；
+3. 打 tag（tag 名与版本号一致，可带 `v` 前缀）：
+
+   ```bash
+   git tag 2025.10.0
+   git push origin 2025.10.0
+   ```
+
+4. CI 校验 manifest 版本与 tag 一致后，自动打包 `hass_baidu_dueros.zip` 并创建 GitHub Release。
+
+若 manifest 版本与 tag 不一致，流水线会失败，不会发布。
 
 ## 实现说明
 

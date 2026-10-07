@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '20*.*.*'
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: HACS validation
+        uses: hacs/action@main
+        with:
+          category: integration
+
+      - name: Hassfest validation
+        uses: home-assistant/actions/hassfest@master
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Extract tag version
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "版本: $TAG"
+
+      - name: Validate manifest version matches tag
+        run: |
+          MANIFEST=$(python3 -c "import json;print(json.load(open('custom_components/hass_baidu_dueros/manifest.json'))['version'])")
+          if [ "$MANIFEST" != "${{ steps.meta.outputs.version }}" ]; then
+            echo "::error::manifest.json 版本 ($MANIFEST) 与 tag (${{ steps.meta.outputs.version }}) 不一致"
+            echo "请先修改 manifest.json 的 version 字段并提交，再重新打 tag。"
+            exit 1
+          fi
+
+      - name: Validate JSON files
+        run: |
+          python3 - <<'EOF'
+          import json
+          for path in (
+              'hacs.json',
+              'custom_components/hass_baidu_dueros/manifest.json',
+              'custom_components/hass_baidu_dueros/translations/en.json',
+              'custom_components/hass_baidu_dueros/translations/zh-Hans.json',
+          ):
+              json.load(open(path, encoding='utf-8'))
+              print(f'OK: {path}')
+          EOF
+
+      - name: Compile check
+        run: python3 -m compileall -q custom_components/hass_baidu_dueros
+
+      - name: Package integration
+        run: |
+          cd custom_components
+          zip -r "../hass_baidu_dueros.zip" hass_baidu_dueros \
+            -x '*/__pycache__/*' -x '*.pyc' -x '*.pyo'
+          cd ..
+          ls -lh hass_baidu_dueros.zip
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: hass_baidu_dueros.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## 小度音箱（DuerOS）
+
+            Home Assistant 集成，详见 [README](README.md)。
+
+            ### 安装方式
+            - HACS：添加自定义仓库后搜索「小度音箱」安装
+            - 手动：解压 `hass_baidu_dueros.zip` 至 `config/custom_components/`

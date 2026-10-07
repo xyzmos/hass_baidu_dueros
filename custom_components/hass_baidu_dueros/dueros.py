@@ -6,6 +6,8 @@ import time
 import traceback
 import uuid
 
+import aiohttp
+
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.storage import Store
 from homeassistant.util import dt as dt_util
@@ -124,15 +126,33 @@ def _shorten(text, limit=200):
     return collapsed[:limit] + ('...' if len(collapsed) > limit else '')
 
 
+class _ReportDeliveryError(Exception):
+    """上报请求未送达（超时/网络错误，重试后仍失败）。"""
+
+
+# 上报请求超时与重试：小度云端偶发慢响应，短超时会产生大量瞬时失败
+_REPORT_TIMEOUT = 15.0
+_REPORT_ATTEMPTS = 2
+_REPORT_RETRY_DELAY = 1.0
+
+
 async def _async_post_report(session, url, payload) -> tuple:
     """上报类 POST：尽力把响应体解析为 JSON。
 
     实测百度侧会用 text/html 的 Content-Type 承载 JSON 结果，
     因此不依赖 Content-Type 判断，一律尝试解析；空响应体按成功处理。
+    超时/网络错误重试一次，仍失败抛 _ReportDeliveryError。
     """
-    async with asyncio.timeout(5):
-        response = await session.post(url, json=payload, headers={"Content-Type": "application/json"})
-        text = (await response.text()).strip()
+    for attempt in range(1, _REPORT_ATTEMPTS + 1):
+        try:
+            async with asyncio.timeout(_REPORT_TIMEOUT):
+                response = await session.post(url, json=payload, headers={"Content-Type": "application/json"})
+                text = (await response.text()).strip()
+            break
+        except (TimeoutError, aiohttp.ClientError) as err:
+            if attempt >= _REPORT_ATTEMPTS:
+                raise _ReportDeliveryError(f'请求失败（{_REPORT_ATTEMPTS} 次尝试）: {err}') from err
+            await asyncio.sleep(_REPORT_RETRY_DELAY)
     if not text:
         return response.status, {}
     try:
@@ -935,6 +955,7 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         self._store = Store(hass, STORAGE_VERSION, f"{INTEGRATION}_open_uids_{entry.entry_id}")
         self._uid_by_token = {}
         self._report_warn_at = 0.0
+        self._report_fail_warn_at = 0.0
         self._report_at = {}
         self._report_timers = {}
         self._sync_at = 0.0
@@ -1478,6 +1499,15 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
 
     # ------------------------------------------------------------- 主动上报
 
+    def _log_delivery_failure(self, action, err):
+        """上报未送达：限频告警，避免网络中断期间刷屏。"""
+        now = time.monotonic()
+        if now - self._report_fail_warn_at > _REPORT_WARN_INTERVAL:
+            self._report_fail_warn_at = now
+            _LOGGER.warning("[%s] %s delivery failed: %s", LOGGER_NAME, action, err)
+        else:
+            _LOGGER.debug("[%s] %s delivery failed: %s", LOGGER_NAME, action, err)
+
     def _log_upstream_result(self, action, status, result):
         """记录上报结果；无法解析为 JSON 的响应（网关/WAF 页面等）按小时限频告警。"""
         if isinstance(result, dict):
@@ -1543,6 +1573,11 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
             try:
                 session = async_get_clientsession(hass)
                 status, result = await _async_post_report(session, DUEROS_CHANGE_REPORT_URL, report)
+            except _ReportDeliveryError as err:
+                self._log_delivery_failure('ChangeReport', err)
+                # 状态变化未送达：排程一次补发，避免上报长期缺失
+                self._schedule_report_flush(hass, device_id, changed_attribute, dueros_attr, _CHANGE_REPORT_INTERVAL)
+                continue
             except Exception:
                 _LOGGER.error("[%s] failed to send ChangeReport: %s", LOGGER_NAME, traceback.format_exc())
                 continue
@@ -1611,6 +1646,9 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
             try:
                 session = async_get_clientsession(hass)
                 status, result = await _async_post_report(session, DUEROS_DEVICE_SYNC_URL, payload)
+            except _ReportDeliveryError as err:
+                self._log_delivery_failure('devicesync', err)
+                continue
             except Exception:
                 _LOGGER.error("[%s] failed to sync devices: %s", LOGGER_NAME, traceback.format_exc())
                 continue
