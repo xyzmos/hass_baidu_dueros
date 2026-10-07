@@ -956,6 +956,7 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         self._uid_by_token = {}
         self._report_warn_at = 0.0
         self._report_fail_warn_at = 0.0
+        self._name_mismatch_warn_at = 0.0
         self._report_at = {}
         self._report_timers = {}
         self._sync_at = 0.0
@@ -1022,15 +1023,17 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
         return result
 
     def _prase_command(self, command, arg):
-        header = command['header']
-        payload = command['payload']
+        header = command.get('header') or {}
+        payload = command.get('payload') or {}
 
         if arg == 'device_id':
-            return payload['appliance']['applianceId']
+            return (payload.get('appliance') or {}).get('applianceId', '')
         elif arg == 'action':
-            return header['name']
+            return header.get('name', '')
         elif arg == 'user_uid':
             return payload.get('openUid', '')
+        elif arg == 'header':
+            return header
         else:
             return command.get(arg)
 
@@ -1108,6 +1111,22 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
                 result = self._errorResult('INVALIDATE_CONTROL_ORDER')
         else:
             result = self._errorResult('ACCESS_TOKEN_EXPIRED' if token_expired else 'ACCESS_TOKEN_INVALIDATE')
+            # ReportStateRequest 鉴权失败时仍保持 ReportStateResponse 名：
+            # 否则小度认为未收到回执并返回 21096 停止该设备同步
+            if action == 'ReportStateRequest':
+                _LOGGER.warning(
+                    "[%s] ReportStateRequest access token 校验失败（expired=%s），"
+                    "回执将按 ReportStateResponse 返回空属性；请在小度 APP 重新绑定技能",
+                    LOGGER_NAME, token_expired)
+                return {
+                    'header': {
+                        'namespace': 'DuerOS.ConnectedHome.Query',
+                        'name': 'ReportStateResponse',
+                        'messageId': header.get('messageId'),
+                        'payloadVersion': header.get('payloadVersion', '1'),
+                    },
+                    'payload': {'attributes': []},
+                }
 
         response_header = {
             'namespace': header.get('namespace'),
@@ -1509,9 +1528,14 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
             _LOGGER.debug("[%s] %s delivery failed: %s", LOGGER_NAME, action, err)
 
     def _log_upstream_result(self, action, status, result):
-        """记录上报结果；无法解析为 JSON 的响应（网关/WAF 页面等）按小时限频告警。"""
+        """记录上报结果；无法解析为 JSON 的响应（网关/WAF 页面等）按小时限频告警。
+
+        21096 由 report_device 单独处理（限频并附排查线索），此处跳过避免重复。
+        """
         if isinstance(result, dict):
             if result.get('status', 0) != 0:
+                if result.get('status') == _SYNC_STATUS_NAME_MISMATCH:
+                    return
                 _LOGGER.warning("[%s] %s rejected (HTTP %s): %s", LOGGER_NAME, action, status, result)
             else:
                 _LOGGER.debug("[%s] %s response: %s", LOGGER_NAME, action, result)
@@ -1587,10 +1611,20 @@ class VoiceControlDueros(PlatformParameter, VoiceControlProcessor):
                 # 小度已按 60 秒窗口计数，重排一次补发而不是丢弃
                 self._schedule_report_flush(hass, device_id, changed_attribute, dueros_attr, _CHANGE_REPORT_INTERVAL)
             elif isinstance(result, dict) and result.get('status') == _SYNC_STATUS_NAME_MISMATCH:
-                _LOGGER.warning(
-                    "[%s] ChangeReport rejected (%s): 服务端未收到 ReportStateResponse，"
-                    "请检查 ReportStateRequest 处理链路（device_id=%s, attribute=%s）",
-                    LOGGER_NAME, result.get('status'), device_id, dueros_attr)
+                # 小度回查属性未收到合法 ReportStateResponse；常见根因：回查携带的
+                # access token 失效、applianceId 已失效、或处理超时/异常。限频告警。
+                now_m = time.monotonic()
+                if now_m - self._name_mismatch_warn_at > _REPORT_WARN_INTERVAL:
+                    self._name_mismatch_warn_at = now_m
+                    _LOGGER.warning(
+                        "[%s] ChangeReport rejected (21096): 服务端未收到 ReportStateResponse。"
+                        "请检索日志中 ReportState 相关记录确认：token 校验失败 / applianceId 失效 / handle fail"
+                        "（device_id=%s, attribute=%s）",
+                        LOGGER_NAME, device_id, dueros_attr)
+                else:
+                    _LOGGER.debug(
+                        "[%s] ChangeReport rejected (21096): device_id=%s, attribute=%s",
+                        LOGGER_NAME, device_id, dueros_attr)
         return attempted
 
     def _schedule_report_flush(self, hass, device_id, changed_attribute, dueros_attr, delay) -> None:
