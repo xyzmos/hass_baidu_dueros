@@ -24,6 +24,8 @@ jobs:
         uses: hacs/action@main
         with:
           category: integration
+          # topics 需在 GitHub 仓库设置中手动添加，无法通过 CI 写入
+          ignore: topics
 
       - name: Hassfest validation
         uses: home-assistant/actions/hassfest@master
